@@ -15,10 +15,22 @@ NAME = "Appliqué Flannel Backpack"
 SHOP = "https://us.supreme.com/products/hqjizbuf-64f49l"
 
 
+def fetch_page(url):
+    # A redirect can select another regional storefront. Accept only the US page.
+    result = subprocess.run(
+        ["curl", "--silent", "--show-error", "--max-time", "10", "--fail",
+         "--write-out", "\\n%{http_code}", url],
+        capture_output=True, check=True, timeout=12,
+    )
+    page, status = result.stdout.decode().rsplit("\n", 1)
+    if status != "200":
+        raise ValueError("Source page unavailable")
+    return page
+
+
 def feed_page(page):
     url = FEED if page == 1 else f"{FEED}{page}/"
-    with urlopen(url, timeout=12) as response:
-        document = html.fromstring(response.read().decode("utf-8"))
+    document = html.fromstring(fetch_page(url))
     rows = document.find_class("restock-item")
     if not rows:
         raise ValueError("Missing US feed entries")
@@ -70,15 +82,7 @@ def record_signal(db, source, stamp):
 
 
 def official(db):
-    # A redirect can select another regional storefront. Accept only the US page.
-    result = subprocess.run(
-        ["curl", "--silent", "--show-error", "--max-time", "10", "--fail",
-         "--write-out", "\\n%{http_code}", SHOP],
-        capture_output=True, check=True, timeout=12,
-    )
-    page, status = result.stdout.decode().rsplit("\n", 1)
-    if status != "200":
-        raise ValueError("US product page unavailable")
+    page = fetch_page(SHOP)
     for match in re.finditer(r'\{\s*"id"\s*:\s*42734290272527\s*,', page):
         variant, _ = json.JSONDecoder().raw_decode(page[match.start():])
         available = variant.get("available")
