@@ -38,32 +38,44 @@ def feed_page(page):
     rows = document.find_class("restock-item")
     if not rows:
         raise ValueError("Missing US feed entries")
+    entries = []
     for row in rows:
         title = row.xpath(".//h3/text()")[0].strip()
         color = row.find_class("restock-color")[0].text_content().strip()
         stamp = row.xpath(".//time/@datetime")[0]
-        yield datetime.fromisoformat(stamp.replace("Z", "+00:00")), (
-            title == NAME and color == "Black" and not row.find_class("restock-badge-new")
-        )
+        size = " ".join(row.xpath('.//*[contains(@class,"restock-sizes")]//text()')).strip()
+        entries.append((int(datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()),
+               title, color, size, bool(row.find_class("restock-badge-new"))))
+    return entries, bool(document.xpath('//a[normalize-space(.)="Next »" or @rel="next"]'))
 
 
 def scan(db):
     cutoff = db.execute("select cursor from state").fetchone()[0]
+    general_start = db.execute("select since from general_start").fetchone()[0]
     latest = cutoff
     events = set()
-    for page in range(1, 21):
-        rows = list(feed_page(page))
-        for date, matches in rows:
-            stamp = int(date.timestamp())
+    page = 1
+    while True:
+        entries, more = feed_page(page)
+        for stamp, title, color, size, is_new in entries:
             latest = max(latest, stamp)
-            if matches and stamp >= cutoff:
-                events.add(stamp)
-        if min(int(date.timestamp()) for date, _ in rows) < cutoff or len(rows) < 8:
+            if stamp >= cutoff and not is_new:
+                events.add((stamp, title, color, size))
+        if min(row[0] for row in entries) < cutoff or not more:
             break
+        page += 1
     with db:
-        for stamp in sorted(events):
-            if db.execute("insert or ignore into events values(?)", (stamp,)).rowcount:
-                record_signal(db, "SupremeCommunity", stamp)
+        for stamp, title, color, size in sorted(events):
+            if title == NAME and color == "Black":
+                if db.execute("insert or ignore into events values(?)", (stamp,)).rowcount:
+                    record_signal(db, "SupremeCommunity", stamp)
+            elif stamp >= general_start:
+                if db.execute("insert or ignore into feed_events values(?,?,?,?)",
+                              (stamp, title, color, size)).rowcount:
+                    detail = " · ".join(v for v in (color, size) if v)
+                    msg = f"US restock: {title}\n{detail}\n{FEED}"
+                    db.execute("insert into queue(chat,body,priority) select chat,?,2 "
+                               "from subs where since<=?", (msg, stamp))
         db.execute("update state set cursor=?", (latest,))
 
 
@@ -79,7 +91,7 @@ def record_signal(db, source, stamp):
         db.execute("update signals set paired=1 where id=?", other)
         return
     db.execute("insert into signals(source,stamp) values(?,?)", (source, stamp))
-    msg = (f"US restock reported by {source}: {NAME} — Black\n"
+    msg = (f"🎒 Priority restock reported by {source}: {NAME} — Black\n"
            f"{datetime.fromtimestamp(stamp, timezone.utc):%Y-%m-%d %H:%M UTC}\n{SHOP}")
     db.execute("insert into queue(chat,body) select chat,? from subs where since<=?",
                (msg, stamp))
@@ -123,7 +135,7 @@ def commands(db):
                 cid = chat["id"]
                 if command == "/start":
                     db.execute("insert or ignore into subs values(?,?)", (cid, message["date"]))
-                    reply = f"Subscribed to US restocks for the black {NAME}. Send /stop to unsubscribe."
+                    reply = f"Subscribed to all SupremeCommunity US restocks. The black {NAME} gets priority. Send /stop to unsubscribe."
                 else:
                     db.execute("delete from subs where chat=?", (cid,))
                     db.execute("delete from queue where chat=?", (cid,))
@@ -133,7 +145,11 @@ def commands(db):
 
 
 def deliver(db):
-    for key, chat, body in db.execute("select id,chat,body from queue order by id limit 20").fetchall():
+    for _ in range(20):
+        row = db.execute("select id,chat,body from queue order by priority,id limit 1").fetchone()
+        if row is None:
+            return
+        key, chat, body = row
         try:
             telegram("sendMessage", chat_id=chat, text=body)
         except HTTPError as error:
@@ -161,6 +177,16 @@ def main():
     create table if not exists official_state(available integer);
     insert into official_state select null where not exists(select 1 from official_state);
     """)
+    db.executescript("""
+    create table if not exists general_start(since integer);
+    insert into general_start select unixepoch() where not exists(select 1 from general_start);
+    create table if not exists feed_events(stamp integer,title text,color text,size text,
+                                           primary key(stamp,title,color,size));
+    """)
+    if "priority" not in {row[1] for row in db.execute("pragma table_info(queue)")}:
+        db.execute("alter table queue add column priority integer not null default 0")
+    db.execute("create index if not exists queue_order on queue(priority,id)")
+    db.commit()
     db.close()
     jobs = [(official, 5), (scan, 5), (commands, 1), (deliver, 0.3)]
     threads = [threading.Thread(target=run_job, args=job) for job in jobs]
@@ -195,3 +221,4 @@ def run_job(job, interval):
 
 if __name__ == "__main__":
     main()
+
