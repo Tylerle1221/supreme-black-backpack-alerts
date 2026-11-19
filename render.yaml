@@ -1,0 +1,17 @@
+services:
+  - type: worker
+    name: supreme-black-backpack-alerts
+    runtime: python
+    region: oregon
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -u bot.py
+    disk:
+      name: subscriptions
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: DB_PATH
+        value: /var/data/bot.db
