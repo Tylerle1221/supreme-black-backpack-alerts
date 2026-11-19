@@ -30,7 +30,11 @@ def fetch_page(url):
 
 def feed_page(page):
     url = FEED if page == 1 else f"{FEED}{page}/"
-    document = html.fromstring(fetch_page(url))
+    try:
+        page_text = fetch_page(url)
+    except subprocess.CalledProcessError:
+        page_text = fetch_page(url.replace("www.supremecommunity.com", "supreme.cmtyone.com"))
+    document = html.fromstring(page_text)
     rows = document.find_class("restock-item")
     if not rows:
         raise ValueError("Missing US feed entries")
