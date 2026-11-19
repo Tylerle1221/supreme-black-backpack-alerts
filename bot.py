@@ -1,5 +1,8 @@
 import json
 import os
+import re
+import subprocess
+import threading
 import sqlite3
 import time
 from datetime import datetime, timezone
@@ -9,7 +12,7 @@ from lxml import html
 
 FEED = "https://www.supremecommunity.com/restocks/us/"
 NAME = "Appliqué Flannel Backpack"
-SHOP = "https://us.supreme.com/collections/bags"
+SHOP = "https://us.supreme.com/products/hqjizbuf-64f49l"
 
 
 def feed_page(page):
@@ -44,11 +47,53 @@ def scan(db):
     with db:
         for stamp in sorted(events):
             if db.execute("insert or ignore into events values(?)", (stamp,)).rowcount:
-                msg = (f"US restock reported: {NAME} — Black\n"
-                       f"{datetime.fromtimestamp(stamp, timezone.utc):%Y-%m-%d %H:%M UTC}\n{SHOP}")
-                db.execute("insert into queue(chat,body) select chat,? from subs where since<=?",
-                           (msg, stamp))
+                record_signal(db, "SupremeCommunity", stamp)
         db.execute("update state set cursor=?", (latest,))
+
+
+def record_signal(db, source, stamp):
+    # Both sites publish different timestamps for the same restock.
+    # Pair at most one report per source, choosing the nearest unmatched event.
+    other = db.execute(
+        "select id from signals where source != ? and paired=0 "
+        "and abs(stamp-?)<=120 order by abs(stamp-?),id desc limit 1",
+        (source, stamp, stamp),
+    ).fetchone()
+    if other:
+        db.execute("update signals set paired=1 where id=?", other)
+        return
+    db.execute("insert into signals(source,stamp) values(?,?)", (source, stamp))
+    msg = (f"US restock reported by {source}: {NAME} — Black\n"
+           f"{datetime.fromtimestamp(stamp, timezone.utc):%Y-%m-%d %H:%M UTC}\n{SHOP}")
+    db.execute("insert into queue(chat,body) select chat,? from subs where since<=?",
+               (msg, stamp))
+
+
+def official(db):
+    # A redirect can select another regional storefront. Accept only the US page.
+    result = subprocess.run(
+        ["curl", "--silent", "--show-error", "--max-time", "10", "--fail",
+         "--write-out", "\\n%{http_code}", SHOP],
+        capture_output=True, check=True, timeout=12,
+    )
+    page, status = result.stdout.decode().rsplit("\n", 1)
+    if status != "200":
+        raise ValueError("US product page unavailable")
+    for match in re.finditer(r'\{\s*"id"\s*:\s*42734290272527\s*,', page):
+        variant, _ = json.JSONDecoder().raw_decode(page[match.start():])
+        available = variant.get("available")
+        if variant.get("sku") == "FW26B12-BLK-OS" and type(available) is bool:
+            break
+    else:
+        raise ValueError("US black variant availability missing")
+    with db:
+        db.execute("begin immediate")
+        previous = db.execute("select available from official_state").fetchone()[0]
+        if available and previous != 1:
+            record_signal(db, "Supreme US", int(time.time()))
+        db.execute("update official_state set available=?", (available,))
+    if previous != available:
+        print("Supreme US black variant available:", available, flush=True)
 
 
 def telegram(method, **payload):
@@ -103,26 +148,41 @@ def main():
     create table if not exists subs(chat integer primary key, since integer);
     create table if not exists queue(id integer primary key, chat integer, body text);
     """)
-    jobs = [(scan, 30), (commands, 1), (deliver, 1)]
-    next_run = {}
+    db.executescript("""
+    create table if not exists signals(id integer primary key, source text, stamp integer, paired integer default 0);
+    create table if not exists official_state(available integer);
+    insert into official_state select null where not exists(select 1 from official_state);
+    """)
+    db.close()
+    jobs = [(official, 5), (scan, 5), (commands, 1), (deliver, 0.3)]
+    threads = [threading.Thread(target=run_job, args=job) for job in jobs]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+
+def run_job(job, interval):
+    db = sqlite3.connect(os.getenv("DB_PATH", "bot.db"), timeout=20)
+    delay = interval
+    first = True
     while True:
-        for job, interval in jobs:
-            if time.monotonic() < next_run.get(job, 0):
-                continue
+        try:
+            job(db)
+            if first:
+                print(job.__name__, "first check OK", flush=True)
+                first = False
             delay = interval
-            try:
-                job(db)
-            except Exception as exc:
-                print(job.__name__, type(exc).__name__, getattr(exc, "code", ""), flush=True)
-                delay = max(interval, 30)
-                if isinstance(exc, HTTPError) and exc.code == 429:
-                    try:
-                        delay = max(delay, int(exc.headers.get("Retry-After", 0)),
-                                    json.loads(exc.read()).get("parameters", {}).get("retry_after", 0))
-                    except (ValueError, TypeError):
-                        delay = max(delay, 60)
-            next_run[job] = time.monotonic() + delay
-        time.sleep(.2)
+        except Exception as exc:
+            db.rollback()
+            delay = min(300, max(delay * 2, 15))
+            if isinstance(exc, HTTPError) and exc.code == 429:
+                try:
+                    delay = max(delay, int(exc.headers.get("Retry-After", 60)))
+                except ValueError:
+                    delay = max(delay, 60)
+            print(job.__name__, type(exc).__name__, getattr(exc, "code", ""), flush=True)
+        time.sleep(delay)
 
 
 if __name__ == "__main__":
